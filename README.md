@@ -57,3 +57,20 @@ Model generation
 
 /FHN-App/
 User app, android only for now
+
+
+### System Requirements
+Scraperhose:
+-  A computer that works
+-  Internet would be a plus (probably should be fast)
+-  A lot of cores for scraping threads
+
+Generators
+- RTX 3090
+- Ryzen 5800X
+- 48GB RAM
+It can probably run on a lot less, but its all I have to test with
+
+FHN-APP:
+I don't know yet but a phone that was made in or after 2023 with AI Hype in mind is probably ideal
+I will be testing against a S24 Ultra and a A35, support is guaranteed for neither.
