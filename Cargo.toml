@@ -1,0 +1,23 @@
+[package]
+name = "Scraperhose"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rss = "2.0"
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+article_scraper = "2.1.1"
+url = "2.5.4"
+tracing = "0.1"
+futures = "0.3"
+html2text = "0.13.6"
+rusqlite = { version = "0.33.0", features = ["bundled"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+
+[profile.dev]
+opt-level = 0
+debug = true
