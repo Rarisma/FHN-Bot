@@ -9,10 +9,9 @@ reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 article_scraper = "2.1.1"
 url = "2.5.4"
-tracing = "0.1"
-futures = "0.3"
 html2text = "0.13.6"
 rusqlite = { version = "0.33.0", features = ["bundled"] }
+chrono = "0.4.39"
 
 [profile.release]
 opt-level = 3

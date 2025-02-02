@@ -1,101 +1,148 @@
-use std::fs::File;
-use std::{
-    io::{prelude::*, BufReader},
-    path::Path,
-};
+mod article;
+
 use std::error::Error;
-use rss::Channel;
-use reqwest::Client;
-use url::Url;
-use article_scraper::ArticleScraper;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use chrono::{TimeZone, Utc};
 use html2text::from_read;
-use rusqlite::{params, Connection, Result};
-
-const RSS_FILE: &str = "/mnt/c/Users/RARI/Desktop/verified_feeds.txt";
-const DB_FILE: &str = "/mnt/c/Users/RARI/Desktop/rss_articles.db";
-
-/* TODO:
-- Parallel
-- Error handling
-- URL checking
-*/
+use reqwest::Client;
+use rss::Channel;
+use rusqlite::{params, Connection};
+use url::Url;
+use article::Article;
+const RSS_FILE: &str = "/home/rari/Feeds.txt";
+const DB_FILE: &str = "/home/rari/Articles.db";
 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    println!("Loading feeds.");
-    let lines = lines_from_file(RSS_FILE);
-    println!("Loaded {} feeds.", lines.len());
-    
-    for line in lines {
-        if let Err(e) = read_feed(&line).await {
-            eprintln!("Error processing feed {}: {}", line, e);
+    println!("Loading feeds from {}.", RSS_FILE);
+    let feed_urls = load_feed_urls(RSS_FILE)?;
+    println!("Loaded {} feed URL(s).", feed_urls.len());
+
+    let conn = Connection::open(DB_FILE)?;
+    create_table(&conn)?;
+
+    for feed_url in feed_urls {
+        if let Err(e) = process_feed(&feed_url, &conn).await {
+            eprintln!("Error processing feed {}: {}", feed_url, e);
         }
     }
     Ok(())
 }
 
-async fn read_feed(url: &str) -> Result<(), Box<dyn Error>> {
-    let content = reqwest::get(url).await?.bytes().await?;
-    let feed: Channel = Channel::read_from(&content[..])?;
-    println!("Loaded feed: {}", feed.title);
-    let DB = Connection::open(DB_FILE)?;
-    let urls = get_urls(&DB)?;
-    println!("Loaded {} articles from DB.", urls.len());
-    let client = Client::new();
+fn load_feed_urls<P: AsRef<Path>>(path: P) -> Result<Vec<String>, Box<dyn Error>> {
+    let file = File::open(path)?;
+    let reader = BufReader::new(file);
+    let urls = reader
+        .lines()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(urls)
+}
 
-    for item in feed.items() {
+async fn process_feed(feed_url: &str, conn: &Connection) -> Result<(), Box<dyn Error>> {
+    let response = reqwest::get(feed_url).await?;
+    let content = response.bytes().await?;
+    let channel = Channel::read_from(&content[..])?;
+    println!("Loaded feed: {}", channel.title());
 
-        //Check if already in DB
-        if urls.contains(&item.link().unwrap_or("").to_string()) {
-            println!("Article already in DB: {}", item.title().unwrap_or("No title"));
+    let existing_urls = get_existing_urls(conn)?;
+    for item in channel.items() {
+        let link = item.link().unwrap_or("");
+        if existing_urls.contains(&link.to_string()) {
+            println!(
+                "Article already in DB: {}",
+                item.title().unwrap_or("No title")
+            );
             continue;
         }
 
-        let scraper = ArticleScraper::new(None).await;
-        let title = item.title().unwrap_or("No title");
-        let link = item.link().ok_or("No link found")?;
-        let url = Url::parse(link)?;
-        let article = scraper.parse(&url, false, &client, None).await?;
+        let article_url = match Url::parse(link) {
+            Ok(url) => url,
+            Err(e) => {
+                eprintln!("Invalid URL {}: {}", link, e);
+                continue;
+            }
+        };
 
-        let plain_text = from_read(article.html.expect("REASON").as_bytes(), 8000)
-            .unwrap_or_else(|_| "Failed to extract text".to_string());
-            
-        let pub_date = item.pub_date().unwrap_or("");
-        update_article(&DB, title, &plain_text, pub_date, "", "", &url.to_string())?;
-        println!("Inserted article: {}", title);
+        match scrape_article(article_url).await {
+            Ok(article) => {
+                println!("Inserting article: {}", article.title);
+                insert_article(conn, &article)?;
+            }
+            Err(e) => {
+                eprintln!("Error scraping article {}: {}", link, e);
+            }
+        }
     }
     Ok(())
 }
 
-fn lines_from_file(filename: impl AsRef<Path>) -> Vec<String> {
-    let file = File::open(filename).expect("no such file");
-    let buf = BufReader::new(file);
-    buf.lines()
-        .map(|l| l.expect("Could not parse line"))
-        .collect()
+async fn scrape_article(url: Url) -> Result<Article, Box<dyn Error>> {
+    let client = Client::new();
+    let scraper = article_scraper::ArticleScraper::new(None).await;
+    let scraped = scraper.parse(&url, false, &client, None).await?;
+
+    let html_content = scraped.html.ok_or("No HTML content found")?;
+    
+    // Extract plaintext
+    let plain_text = from_read(html_content.as_bytes(), 8000);
+
+    // Extract publish date
+    let publish_date = if let Some(date) = scraped.date {
+        date.to_string()
+    } 
+    // Default to epoch if no date is found
+    else { Utc.timestamp_nanos(0).to_string() };
+
+    Ok(Article {
+        title: scraped.title.unwrap_or_else(|| "No title".to_string()),
+        content: plain_text.unwrap_or("No content".to_string()),
+        publish_date,
+        top_image: scraped.thumbnail_url.unwrap_or_default(),
+        keywords: String::new(),
+        url: url.to_string(),
+    })
 }
 
-pub fn update_article( conn: &Connection, title: &str, article_text: &str,
-    publish_date: &str, top_image: &str, keywords: &str, url: &str) -> Result<usize> {
-        conn.execute(
-            "INSERT INTO articles (title, article_text, publish_date, top_image, keywords, url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![title, article_text, publish_date, top_image, keywords, url],
-        )
+fn insert_article(conn: &Connection, article: &Article) -> rusqlite::Result<usize> {
+    conn.execute(
+        "INSERT INTO articles (title, article_text, publish_date, top_image, keywords, url)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            article.title,
+            article.content,
+            article.publish_date,
+            article.top_image,
+            article.keywords,
+            article.url
+        ],
+    )
 }
 
-fn get_urls(conn: &Connection) -> Result<Vec<String>> {
-    print!("Getting urls from DB...");
+fn get_existing_urls(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT url FROM articles")?;
-    println!("running.");
-    let urls = stmt.query_map([], |row| row.get(0))?;
-    println!("mapping.");
-    let mut url_vec = Vec::new();
-    for url in urls {
-        url_vec.push(url?);
+    let url_iter = stmt.query_map([], |row| row.get(0))?;
+    let mut urls = Vec::new();
+    for url in url_iter {
+        urls.push(url?);
     }
-    println!("Got {} URLs.", url_vec.len());
+    Ok(urls)
+}
 
-    Ok(url_vec)
+fn create_table(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS articles (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            article_text TEXT NOT NULL,
+            publish_date TEXT,
+            top_image TEXT,
+            keywords TEXT,
+            url TEXT NOT NULL UNIQUE
+         )",
+        [],
+    )?;
+    Ok(())
 }
