@@ -1,0 +1,12 @@
+[build]
+# Target the host's ISA for maximum performance.
+rustflags = ["-C", "target-cpu=native"]
+
+[profile.release]
+opt-level = 3           # Maximum optimization for speed.
+debug = false           # No debug info.
+lto = "fat"             # Fat LTO for aggressive cross-module optimizations.
+codegen-units = 1       # Fewer units can yield better optimization.
+panic = "abort"         # Abort on panic to reduce overhead.
+incremental = false     # Disable incremental compilation for final build.
+overflow-checks = false # Disable runtime overflow checks.
