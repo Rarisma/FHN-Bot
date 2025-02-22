@@ -1,0 +1,26 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net9.0</TargetFramework>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <InvariantGlobalization>true</InvariantGlobalization>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="DSharpPlus" Version="5.0.0-nightly-02457" />
+        <PackageReference Include="DSharpPlus.Commands"  Version="5.0.0-nightly-02457"/>
+        <PackageReference Include="Google.Apis.YouTube.v3" Version="1.69.0.3680" />
+        <PackageReference Include="Lofcz.Forks.YoutubeTranscriptApi" Version="0.4.2" />
+        <PackageReference Include="PdfPig" Version="0.1.10-alpha-20250209-1660c" />
+        <PackageReference Include="SmartReader" Version="0.10.0" />
+    </ItemGroup>
+
+    <ItemGroup>
+      <None Update="config.json">
+        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      </None>
+    </ItemGroup>
+
+</Project>

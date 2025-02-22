@@ -1,235 +1,190 @@
-mod article;
+use std::{
+    error::Error,
+    fs::File,
+    io::{BufRead, BufReader},
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
-use std::error::Error;
-use std::fs::File;
-use std::io::{BufRead, BufReader};
-use std::path::Path;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-use chrono::{TimeZone, Utc};
-use html2text::from_read;
-use reqwest::Client;
-use rss::Channel;
-use rusqlite::{params, Connection};
-use tokio::sync::Semaphore;
+use futures_util::{stream, StreamExt};
+use log::{debug, error, info};
+use mysql_async::Pool;
+use reqwest::{blocking::Client as BlockingClient, Client};
+use sysinfo::{System};
+use tokio::time;
 use url::Url;
-use article::Article;
+
+use feed_rs::parser;
+
+mod db;
+mod metrics;
+use metrics::Metrics;
 
 const RSS_FILE: &str = "/home/rari/Feeds.txt";
-const DB_FILE: &str = "/home/rari/Articles.db";
-const SKIP_FIRST: usize = 2000; // Change this value to skip the first x feeds
+const SKIP_FIRST: usize = 555;
+const VERBOSE: bool = true;
 
-/// A simple metrics tracker.
-struct Metrics {
-    grand_total: AtomicUsize,
-    already_seen: AtomicUsize,
-    per_hour: AtomicUsize,
-    current_hour: AtomicUsize,
+macro_rules! vlog {
+    ($verbose:expr, $($arg:tt)*) => {
+        if $verbose {
+            debug!($($arg)*);
+        }
+    };
 }
 
-impl Metrics {
-    fn new() -> Self {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        let current_hour = (now.as_secs() / 3600) as usize;
-        Metrics {
-            grand_total: AtomicUsize::new(0),
-            already_seen: AtomicUsize::new(0),
-            per_hour: AtomicUsize::new(0),
-            current_hour: AtomicUsize::new(current_hour),
-        }
-    }
-
-    fn increment_grand_total(&self) {
-        self.grand_total.fetch_add(1, Ordering::SeqCst);
-        self.increment_per_hour();
-    }
-
-    fn increment_already_seen(&self) {
-        self.already_seen.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn increment_per_hour(&self) {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        let hour = now.as_secs() / 3600;
-        let stored_hour = self.current_hour.load(Ordering::SeqCst) as u64;
-        if hour > stored_hour {
-            self.current_hour.store(hour as usize, Ordering::SeqCst);
-            self.per_hour.store(0, Ordering::SeqCst);
-        }
-        self.per_hour.fetch_add(1, Ordering::SeqCst);
-    }
-
-    fn get_metrics(&self) -> (usize, usize, usize) {
-        (
-            self.grand_total.load(Ordering::SeqCst),
-            self.per_hour.load(Ordering::SeqCst),
-            self.already_seen.load(Ordering::SeqCst),
-        )
-    }
-}
-
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn Error + Send + Sync + 'static>> {
-    println!("Loading feeds from {}.", RSS_FILE);
-    let feed_urls = load_feed_urls(RSS_FILE).unwrap_or(Vec::new());
-    println!("Loaded {} feed URL(s).", feed_urls.len());
-
-    let mut conn = Connection::open(DB_FILE)?;
-    create_table(&conn)?;
-
-    let metrics = Arc::new(Metrics::new());
-
-    // Skip the first SKIP_FIRST feeds
-    for feed_url in feed_urls.iter().skip(SKIP_FIRST) {
-        match process_feed(feed_url, &conn, metrics.clone()).await {
-            Ok(articles) => {
-                println!("Bulk inserting {} articles from feed {}", articles.len(), feed_url);
-                if let Err(e) = bulk_insert_articles(&mut conn, &articles) {
-                    eprintln!("Error bulk inserting articles for feed {}: {}", feed_url, e);
-                }
-            }
-            Err(e) => eprintln!("Error processing feed {}: {}", feed_url, e),
-        }
-
-        let (grand_total, per_hour, already_seen) = metrics.get_metrics();
-        println!(
-            "Metrics: Grand Total: {}, This Hour: {}, Already Seen: {}",
-            grand_total, per_hour, already_seen
-        );
-    }
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    env_logger::init();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    rt.block_on(async_main())?;
     Ok(())
 }
 
-fn load_feed_urls<P: AsRef<Path>>(path: P) -> Result<Vec<String>, Box<dyn Error>> {
+async fn async_main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    std::panic::set_hook(Box::new(|panic_info| {
+        eprintln!("Global panic hook caught: {panic_info}");
+    }));
+
+    let start_time = Instant::now();
+    info!("Starting feed scanning process.");
+
+    let client = Client::builder()
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+                     AppleWebKit/537.36 (KHTML, like Gecko) \
+                     Chrome/133.0.0.0 Safari/537.36")
+        .build()?;
+
+    let feed_urls: Vec<String> = load_feed_urls(RSS_FILE)?;
+    let pool = Pool::new("mysql://root:Mavik@localhost:3306/Research");
+    db::initialize_db(&pool).await?;
+    info!("Database initialised.");
+
+    let metrics = Arc::new(Metrics::new());
+
+    // Spawn a background task to print metrics every 5 seconds.
+    {
+        let metrics = Arc::clone(&metrics);
+        let start_time = Instant::now();
+        tokio::spawn(async move {
+            let mut sys = System::new_all();
+            let mut interval = time::interval(Duration::from_secs(5));
+            loop {
+                interval.tick().await;
+                sys.refresh_all();
+              //  let cpu_usage = sys.global_cpu_info().cpu_usage();
+                let memory_usage = sys.used_memory(); // in KB
+                let found = metrics.found.load(std::sync::atomic::Ordering::Relaxed);
+                let already_saw = metrics.already_saw.load(std::sync::atomic::Ordering::Relaxed);
+                let elapsed = start_time.elapsed();
+                info!(
+                    "Metrics - Found: {}, Already saw: {}, Run time: {:.2?}, RAM: {} KB",
+                    found, already_saw, elapsed/*, cpu_usage*/, memory_usage
+                );
+            }
+        });
+    }
+
+    info!("Scanning {} RSS feeds.", feed_urls.len());
+    let concurrency_limit = 50;
+
+    stream::iter(feed_urls.into_iter().skip(SKIP_FIRST))
+        .map(|feed_url| {
+            let pool_clone = pool.clone();
+            let client_clone = client.clone();
+            let metrics_clone = Arc::clone(&metrics);
+            async move {
+                match process_feed(&feed_url, pool_clone, client_clone, metrics_clone).await {
+                    Ok(()) => info!("Processed feed: {}", feed_url),
+                    Err(e) => error!("Error processing feed {}: {}", feed_url, e),
+                }
+            }
+        })
+        .buffer_unordered(concurrency_limit)
+        .for_each(|_| async {})
+        .await;
+
+    pool.disconnect().await?;
+    info!("Program finished in {:.2?}.", start_time.elapsed());
+    Ok(())
+}
+
+fn load_feed_urls<P: AsRef<Path>>(path: P) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     let urls = reader.lines().collect::<Result<Vec<_>, _>>()?;
     Ok(urls)
 }
 
-/// Processes a single feed, scraping articles concurrently (up to 10 at a time).
-/// Returns a Vec<Article> of successfully scraped articles.
+fn download_rss_feed(
+    url: &str,
+    blocking_client: &BlockingClient,
+) -> Result<Vec<String>, Box<dyn Error + Send + Sync>> {
+    let response = blocking_client.get(url).send()?;
+    let responsestat = blocking_client.get(url).send()?;
+    if !response.status().is_success() {
+        error!("Non-success status {} for feed URL: {}", response.status(), url);
+        return Ok(vec![]);
+    }
+    let bytes = response.bytes()?;
+    debug!("download_rss_feed: status={} len={} url={}", responsestat.status(), bytes.len(), url);
+    let feed = parser::parse(&bytes[..])?;
+    let mut article_urls = Vec::new();
+    for entry in feed.entries {
+        if let Some(link) = entry.links.first() {
+            article_urls.push(link.href.clone());
+        }
+    }
+    println!("scraped {url} got {} article URLs", article_urls.len());
+    Ok(article_urls)
+}
+
+/// Process a feed:
+/// 1. Download the feed and extract URLs.
+/// 2. Retrieve existing URLs from Raw_Articles and Discovered.
+/// 3. Insert any new URLs into the Discovered table and update metrics.
 async fn process_feed(
     feed_url: &str,
-    conn: &Connection,
+    pool: Pool,
+    client: Client,
     metrics: Arc<Metrics>,
-) -> Result<Vec<Article>, Box<dyn Error + Send + Sync + 'static>> {
-    let response = reqwest::get(feed_url).await?;
-    let content = response.bytes().await?;
-    let channel = Channel::read_from(&content[..])?;
-    println!("Loaded feed: {}", channel.title());
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    vlog!(VERBOSE, "Fetching feed: {}", feed_url);
 
-    let existing_urls = get_existing_urls(conn)?;
-    let semaphore = Arc::new(Semaphore::new(10));
-    let mut tasks = Vec::new();
-
-    for item in channel.items() {
-        let link = item.link().unwrap_or("");
-        if existing_urls.contains(&link.to_string()) {
-            println!("Article already in DB: {}", item.title().unwrap_or("No title"));
-            metrics.increment_already_seen();
-            continue;
+    let article_urls: Vec<String> = tokio::task::spawn_blocking({
+        let feed_url = feed_url.to_string();
+        move || {
+            let blocking_client = reqwest::blocking::Client::builder()
+                .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) \
+                             AppleWebKit/537.36 (KHTML, like Gecko) \
+                             Chrome/133.0.0.0 Safari/537.36")
+                .build()?;
+            download_rss_feed(&feed_url, &blocking_client)
         }
-
-        let article_url = match Url::parse(link) {
-            Ok(url) => url,
-            Err(e) => {
-                eprintln!("Invalid URL {}: {}", link, e);
-                continue;
-            }
-        };
-
-        let permit = semaphore.clone().acquire_owned().await?;
-        let task = tokio::spawn(async move {
-            let _permit = permit;
-            scrape_article(article_url).await
-        });
-        tasks.push(task);
-    }
-
-    let mut articles = Vec::new();
-    for task in tasks {
-        match task.await {
-            Ok(Ok(article)) => {
-                println!("Scraped article: {}", article.title);
-                articles.push(article);
-                metrics.increment_grand_total();
-            }
-            Ok(Err(e)) => eprintln!("Error scraping article: {}", e),
-            Err(e) => eprintln!("Task join error: {}", e),
-        }
-    }
-    Ok(articles)
-}
-
-async fn scrape_article(url: Url) -> Result<Article, Box<dyn Error + Send + Sync + 'static>> {
-    let client = Client::new();
-    let scraper = article_scraper::ArticleScraper::new(None).await;
-    let scraped = scraper.parse(&url, false, &client, None).await?;
-
-    let html_content = scraped.html.ok_or("No HTML content found")?;
-    let plain_text = from_read(html_content.as_bytes(), 8000);
-
-    let publish_date = if let Some(date) = scraped.date {
-        date.to_string()
-    } else {
-        Utc.timestamp_nanos(0).to_string()
-    };
-
-    Ok(Article {
-        title: scraped.title.unwrap_or_else(|| "No title".to_string()),
-        content: plain_text.unwrap_or("No content".to_string()),
-        publish_date,
-        top_image: scraped.thumbnail_url.unwrap_or_default(),
-        keywords: String::new(),
-        url: url.to_string(),
     })
-}
+        .await??;
 
-fn bulk_insert_articles(conn: &mut Connection, articles: &[Article]) -> rusqlite::Result<()> {
-    let tx = conn.transaction()?;
-    {
-        let mut stmt = tx.prepare(
-            "INSERT INTO articles (title, article_text, publish_date, top_image, keywords, url)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )?;
-        for article in articles {
-            stmt.execute(params![
-                article.title,
-                article.content,
-                article.publish_date,
-                article.top_image,
-                article.keywords,
-                article.url,
-            ])?;
-        }
+    vlog!(VERBOSE, "Loaded {} URLs from: {}", article_urls.len(), feed_url);
+    let existing_urls = db::get_existing_urls(&pool).await?;
+    let new_urls: Vec<String> = article_urls
+        .into_iter()
+        .filter(|url| {
+            if existing_urls.contains(url) {
+                metrics.increment_already_seen();
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
+    if !new_urls.is_empty() {
+        info!("Inserting {} new discovered URLs from feed: {}", new_urls.len(), feed_url);
+        db::bulk_insert_discovered(&pool, &new_urls).await?;
+        metrics.increment_found(new_urls.len());
     }
-    tx.commit()
-}
 
-fn get_existing_urls(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT url FROM articles")?;
-    let url_iter = stmt.query_map([], |row| row.get(0))?;
-    let mut urls = Vec::new();
-    for url in url_iter {
-        urls.push(url?);
-    }
-    Ok(urls)
-}
-
-fn create_table(conn: &Connection) -> rusqlite::Result<()> {
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS articles (
-            id INTEGER PRIMARY KEY,
-            title TEXT NOT NULL,
-            article_text TEXT NOT NULL,
-            publish_date TEXT,
-            top_image TEXT,
-            keywords TEXT,
-            url TEXT NOT NULL UNIQUE
-         )",
-        [],
-    )?;
     Ok(())
 }
