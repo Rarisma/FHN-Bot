@@ -59,7 +59,7 @@ public class Program
             return;
         }
 
-        string prompt = BuildPrompt(article.Content);
+        string prompt = BuildPrompt(article.Content, Format.Article);
         try
         {
             var config = Config.Load();
@@ -73,33 +73,121 @@ public class Program
         }
     }
 
+    [InteractionAllowedContexts([DiscordInteractionContextType.Guild])]
+    [InteractionInstallType([DiscordApplicationIntegrationType.GuildInstall])]
+    [Command("summarise-chat")]
+    [Description("Summarise chat...")]
+    public static async Task SummariseChat(CommandContext ctx, int MessageCount, bool FormalMode)
+    {
+        //This is gonna take awhile
+        await ctx.DeferResponseAsync();
+        
+        //Block negative number counts or large counts
+        if (MessageCount < 1 || MessageCount > 1500)
+        {
+            ctx.RespondAsync("https://tenor.com/view/i-robot-no-nope-nah-disagree-gif-15992656");
+        }
+        
+        //Get messages
+        var messages = new List<DiscordMessage>();
+        string prompt = "";
+        // Iterate asynchronously over the messages
+        await foreach (var message in ctx.Channel.GetMessagesAsync(MessageCount))
+        {
+            prompt += $"{message.Content}\n{message.Content}";
+            messages.Add(message);
+        }
+
+        if (FormalMode)
+        {
+            prompt = BuildPrompt(prompt, Format.ChatSummaryFormal);
+        }
+        else
+        {
+            prompt = BuildPrompt(prompt, Format.ChatSummaryInformal);
+        }
+        
+        var config = Config.Load();
+        var summary = await SummariseContentAsync(prompt, 500, config.GeminiAPIKey);
+        await ctx.RespondAsync(summary);
+    }
+    
+    private enum Format
+    {
+        ChatSummaryFormal,
+        ChatSummaryInformal,
+        Article
+    }
+    
     /// <summary>
     /// Creates dynamic prompt for the user to summarise the article.
     /// </summary>
     /// <param name="content">Article Content</param>
     /// <param name="tok">Length (unimplemented)</param>
     /// <returns>LLM Prompt</returns>
-    static string BuildPrompt(string content)
+    static string BuildPrompt(string content, Format format)
     {
-        return $"""
-                   Create a concise summary for the provided story, your summary should be roughly two paragraphs.
-                   Begin by directly stating the main points and essence of the narrative. Ensure that your response is 
-                   formatted in plain text, without the use of any markdown or special formatting.
-                                               
-                   Guidelines:
-                       Summaries should be easy for the average person to understand, if an article is
-                       on a complicated subject, try to make it easy for the reader to understand.
-                       Stories are within the public domain and cannot contain confidential information.
-                       Stories relating to politics should be written from a purely neutral stance.
-                       If multiple stories appear at once, summarize only the first article and ignore the rest.
-                       Ignore advertisement content if present. The article is not an advertisement; do not summarize advertisements.
-                       The summary must consist of only two paragraphs, summaries must be concise or will cut off.
-                       Start directly with the narrative content, omitting any introductory phrases or labels.
-                       Do not include any headings, titles, or labels within your response.
-                       Write solely in plain text format; do not use markdown or any other formatting system.
-                       
-                    Content: {content}
-               """;
+        switch (format)
+        {
+            case Format.ChatSummaryInformal:
+                return $"""
+                            Create a concise summary for the provided chat log, your summary should be roughly a paragraph.
+                            Begin by directly stating the main points and points discussed. Ensure that your response is 
+                            formatted in plain text, without the use of any markdown or special formatting.
+                                                        
+                            Guidelines:
+                                Summaries should be easy for the average person to read.
+                                Chatlogs are within the public domain and cannot contain confidential information.
+                                Write from a purely neutral stance, do not give your own opinion.
+                                If multiple conversations appear, summarise each into a small set of bulletpoints.
+                                The summary must consist of only a paragraph, summaries must be concise or will cut off.
+                                Start directly with the narrative content, omitting any introductory phrases or labels.
+                                Do not include any headings, titles, or labels within your response.
+                                Write solely in plain text format; do not use markdown or any other formatting system.
+                                Maintain words used within the format, i.e slang and acronyms. 
+                                Content: {content}
+                        """;
+            case Format.ChatSummaryFormal:
+                return $"""
+                            Create a concise formal summary for the provided chat log, your summary should be roughly a paragraph.
+                            Begin by directly stating the main points and points discussed. Ensure that your response is 
+                            formatted in plain text, without the use of any markdown or special formatting.
+                                                        
+                            Guidelines:
+                                Summaries should be easy for the average person to read.
+                                Chatlogs are within the public domain and cannot contain confidential information.
+                                Write from a purely neutral stance, do not give your own opinion.
+                                If multiple conversations appear, summarise each into a small set of bulletpoints.
+                                The summary must consist of only a paragraph, summaries must be concise or will cut off.
+                                Start directly with the narrative content, omitting any introductory phrases or labels.
+                                Do not include any headings, titles, or labels within your response.
+                                Write solely in plain text format; do not use markdown or any other formatting system.
+                                Content: {content}
+                        """;
+            case Format.Article:
+                return $"""
+                            Create a concise summary for the provided story, your summary should be roughly two paragraphs.
+                            Begin by directly stating the main points and essence of the narrative. Ensure that your response is 
+                            formatted in plain text, without the use of any markdown or special formatting.
+                                                        
+                            Guidelines:
+                                Summaries should be easy for the average person to understand, if an article is
+                                on a complicated subject, try to make it easy for the reader to understand.
+                                Stories are within the public domain and cannot contain confidential information.
+                                Stories relating to politics should be written from a purely neutral stance.
+                                If multiple stories appear at once, summarize only the first article and ignore the rest.
+                                Ignore advertisement content if present. The article is not an advertisement; 
+                                do not summarize advertisements.
+                                The summary must consist of only two paragraphs, summaries must be concise or will cut off.
+                                Start directly with the narrative content, omitting any introductory phrases or labels.
+                                Do not include any headings, titles, or labels within your response.
+                                Write solely in plain text format; do not use markdown or any other formatting system.
+                                
+                             Content: {content}
+                        """;
+            default:
+                throw new FormatException("Unknown format");
+        }
     }
     
     static DiscordMessageBuilder CreateArticleEmbed(Article article, string Summary)
